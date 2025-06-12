@@ -1,10 +1,22 @@
+import sys
+import os
 from controller import DMoE
-import torch
-from torch.nn import Sequential, Transformer, TransformerEncoderLayer, TransformerDecoderLayer, Linear, ReLU, Conv1d, Conv2d, Conv3d, MaxPool1d, MaxPool2d, MaxPool3d
-from torch.optim import Adam
+from transformers import GPT2LMHeadModel, GPT2Config, GPT2Tokenizer, AutoModel
 
-dataAnalyzers=[] #set up annotated the pile/c4/discord conversations
-dataExperts=[] #set up the pile/c4/discord conversations
-dmoe=DMoE(TransformerEncoderLayer(512,8), TransformerDecoderLayer(512,8),512,[1 for i in range(512)],0.8,10,0.3)
-dmoe.trainAnalysis(dataAnalyzers)
-dmoe.trainExperts(dataExperts)
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
+from model.preProcesser import DataHandler
+
+
+gpt=GPT2LMHeadModel(GPT2Config())
+bert=AutoModel.from_pretrained("bert-base-cased")
+testData=[]
+
+dataAnalyzers=[]
+dataExperts=[]
+dmoe=DMoE(bert,gpt,512,[1 for i in range(512)],0.8,16,0.3)
+dmoe.trainingPipeline(testData)
+
+#train base on linguistics -> organize dataset in order of decreasing similarity from area with the least data -> retrain on cached data that doesn't fit a domain -> more epochs from step 3 if needed or go from step 2 and do a new dataset

@@ -1,19 +1,21 @@
+import json
+from transformers import GPT2LMHeadModel, GPT2Config
+import torch
+import ast
+
 class MemoryHandler:
     def __init__(self):
         pass
     def writeExpert(self,encoding,parameters):
-        try:
-            with open("./memory.json", 'w') as memory:
-                data=memory.dumps()
-                data[encoding]=parameters
-                memory.dumps(data)
-            return "Success"
-        except Exception as e:
-            return f"Error: {e}"
+        memoryData=torch.load('C:/Users/milla/dmoe/model/memory.pt')
+        memoryData[f"{encoding}"]=parameters
+        torch.save(memoryData,'./model/memory.pt')
+        return "Success"
     def getExpertFromEncoding(self, encoding):
-        with open("./memory.json", 'r') as memory:
-            pass
-    def getExpertEncodings(self, ):
-        with open("./memory.json",'r') as memory:
-            data=memory.dumps()
-            return data[""]
+        return torch.load('./model/memory.pt')[f"{encoding}"]
+    def getExpertEncodings(self):
+        data=torch.load('./model/memory.pt')
+        return list(map(ast.literal_eval,list(data.keys())))
+
+print(MemoryHandler().writeExpert("asdf",torch.tensor([1],dtype=torch.bfloat16)))
+print(MemoryHandler().getExpertFromEncoding("asdf"))

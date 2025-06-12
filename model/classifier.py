@@ -1,61 +1,120 @@
-from dataAnalysis import DataAnalysis
 from memory import MemoryHandler
-import numpy as np
+from transformers import GPT2LMHeadModel, GPT2Config
+import torch
+import time
 
 class Classifier:
-    def __init__(self, expertStructure, weights, threshold, expertMergeCount, cutThreshold):
-        self.weights=weights
+    def __init__(self, weights, threshold, dmodel, expertMergeCount, cutThreshold):
+        if weights!=None:
+            self.weights=torch.tensor(weights,dtype=torch.bfloat16).to("cuda")
+        else:
+            self.weights=torch.tensor([1 for i in range(dmodel)],dtype=torch.bfloat16).to("cuda")
         self.threshold=threshold
         self.expertMergeCount=expertMergeCount
         self.cutThreshold=cutThreshold
-    def getExpert(self, encoding):
+        self.firstRun=False
+        self.baseModel=None
+    def getExpert(self, encoding, data=None, mode="prod"):
         memory=MemoryHandler()
-        experts=memory.read("*")
-        comparisons={}
-        for expertEncoding in experts:
-            comparisons[expertEncoding]=np.dot(np.array(encoding)-np.array(expertEncoding),self.weights)
-        for comparison,difference in comparisons:
-            comparisonAvg=sum(comparisons.values())/len(comparisons.values())
-            comparisons[comparison]=1-(difference-comparisonAvg)/comparisonAvg
-        bestExpert=max(comparisons.values())
-        if bestExpert<self.threshold:
-            mergingExperts=[]
-            mergingExperts.append(bestExpert)
-            self.removeKeyFromDictionary(comparisons,bestExpert)
-            for i in range(mergingExperts):
-                maxComparison=max(comparisons.values())
-                bestExpert=self.getKeyFromValue(comparisons,maxComparison)
-                mergingExperts.append(bestExpert)
-                self.removeKeyFromDictionary(comparisons,[bestExpert])
-            checked=[]
-            mergingExpertsFiltered=[]
-            for i in range(len(bestExpert)):
-                for j in range(len(bestExpert)):
-                    difference=(abs(bestExpert[i]-bestExpert[j]))/min(bestExpert[i],bestExpert[j])
-                    if [i,j] not in checked and [j,i] not in checked:
-                        checked.append([i,j])
-                        if difference>self.cutThreshold:
-                            mergingExpertsFiltered.append(max([bestExpert[i],bestExpert[j]]))
-            if len(mergingExpertsFiltered)==0:
-                mergingExpertsFiltered=max(mergingExperts)
-            newExpert=self.mergeExperts(mergingExpertsFiltered)
-            memory.writeExpert(encoding, newExpert)
-            return [encoding, newExpert]
+        encoding=torch.tensor(encoding,dtype=torch.bfloat16).to("cuda")
+        experts=memory.getExpertEncodings()
+        self.experts=torch.tensor(experts,dtype=torch.bfloat16).to("cuda")
+        if len(self.experts)==0:
+            self.experts=torch.tensor([encoding],dtype=torch.bfloat16).to("cuda")
+            startExpert=GPT2LMHeadModel(GPT2Config()).to("cuda")
+            memory.writeExpert(encoding,startExpert.to(dtype=torch.bfloat16).state_dict())
+        differences=self.experts-encoding.unsqueeze(0)
+        comparisons=torch.mean(torch.abs(differences*self.weights), axis=1)
+        bestExpertIdx=torch.argmin(comparisons)
+        bestExpert=comparisons[bestExpertIdx]
+        bestExpertEncoding=self.experts[bestExpertIdx]
+        bestExpertDist=1-torch.mean(abs((bestExpertEncoding-encoding)/torch.maximum(bestExpertEncoding+1e-8, encoding+1e-8)))
+        if bestExpertDist<self.threshold:
+            if self.baseModel!=None:
+                mergingExperts=[bestExpertEncoding]
+                comparisonCopy=comparisons.clone()
+                comparisonCopy=torch.cat([comparisonCopy[:int(bestExpertIdx)], comparisonCopy[int(bestExpertIdx)+1:]])
+                if len(comparisonCopy)>0:
+                    remainingScores = comparisons
+                    sortedIndices = torch.argsort(remainingScores, descending=True)
+                    numAdditionalExperts = min(len(sortedIndices), self.expertMergeCount - 1)
+                    for idx in sortedIndices[:numAdditionalExperts]:
+                        mergingExperts.append(experts[int(idx)])
+                    mergingExperts=torch.tensor(mergingExperts,dtype=torch.bfloat16).to("cuda")
+                mergingExpertsFiltered=self.filterExperts(mergingExperts,encoding)
+                if len(mergingExpertsFiltered)==0:
+                    if mode == "prod":
+                        mergingExpertsFiltered=bestExpertEncoding
+                    elif mode == "train":
+                        self.cacheData(encoding, data)
+                        return self.baseModel[0]
+                newExpert=self.mergeExperts(mergingExpertsFiltered).to("cuda")
+                memory.writeExpert(encoding,newExpert.to(dtype=torch.bfloat16).state_dict())
+                return encoding
+            else:
+                return encoding
         else:
-            return [bestExpert,None]
-    def getKeyFromValue(self, dictionary, desiredValue):
-        for key,value in dictionary:
-            if value==desiredValue:
-                return key
-    def removeKeyFromDictionary(self, dictionary, removedKey):
-        returnDict={}
-        for key, value in dictionary:
-            if key not in removedKey:
-                returnDict[key]=value
-        return returnDict
-    def mergeExperts(self, mergingExperts):
-        if mergingExperts==None:
-            return "Expert merging is none"
+            return bestExpertEncoding
+    def filterExperts(self,experts,encoding):
+        if len(experts) <= 1:
+            return experts
+        self.experts = torch.tensor(experts,dtype=torch.bfloat16).to("cuda")
+        expertDists=torch.mean(abs((experts-encoding)/torch.maximum(experts+1e-8, encoding+1e-8)))
+        return self.experts[expertDists > self.cutThreshold]
+    def cacheData(self,encoding,data):
+        try:
+            cachedData=torch.load("C:/Users/milla/dmoe/model/dataCache.pt")
+        except:
+            cachedData = {}
+        cachedData[tuple(encoding.cpu().tolist())] = data
+        torch.save(cachedData,"C:/Users/milla/dmoe/model/dataCache.pt")
+    def mergeExperts(self, mergingExperts, noiseThreshold=1e-6, consensusThreshold=0.8):
+        if len(mergingExperts)<=1:
+            return mergingExperts
         else:
-            #GRADMERGEIMPLEMENTATION
-            pass
+            mergedExpert = GPT2LMHeadModel(GPT2Config())
+            memory=MemoryHandler()
+            baseStateDict = self.baseModel[1].to("cuda").half().state_dict()
+            mergedStateDict = {}
+            expertStateDicts = [memory.getExpertFromEncoding(expert) for expert in mergingExperts]
+            numExperts = len(expertStateDicts)
+            for paramName, baseParam in baseStateDict.items():
+                expertParams = torch.stack([
+                    expertDict[paramName] for expertDict in expertStateDicts
+                ])
+                paramDiffs = expertParams - baseParam.unsqueeze(0)
+                significantMask = torch.abs(paramDiffs) > noiseThreshold
+                paramSigns = torch.sign(paramDiffs)
+                paramSigns = torch.where(significantMask, paramSigns, torch.zeros_like(paramSigns))
+                positiveVotes = (paramSigns > 0).sum(dim=0).float()
+                negativeVotes = (paramSigns < 0).sum(dim=0).float()
+                totalVotes = positiveVotes + negativeVotes
+                consensusPositive = positiveVotes >= negativeVotes
+                hasConsensus = (torch.max(positiveVotes, negativeVotes) / numExperts) >= consensusThreshold
+                strongConsensus = hasConsensus & (totalVotes > 0)
+                hasConflict = ~hasConsensus & (totalVotes > 0)
+                noChanges = totalVotes == 0
+                mergedParam = baseParam.clone()
+                if strongConsensus.any():
+                    consensusMask = strongConsensus & significantMask
+                    consensusDiffs = torch.where(consensusMask, paramDiffs, torch.zeros_like(paramDiffs))
+                    avgConsensus = consensusDiffs.sum(dim=0) / consensusMask.sum(dim=0).clamp(min=1)
+                    mergedParam = torch.where(strongConsensus, baseParam + avgConsensus, mergedParam)
+                if hasConflict.any():
+                    weights = torch.abs(paramDiffs) * significantMask.float()
+                    weightedDiffs = paramDiffs * weights
+                    totalWeights = weights.sum(dim=0).clamp(min=1e-12)
+                    weightedAvg = weightedDiffs.sum(dim=0) / totalWeights
+                    mergedParam = torch.where(hasConflict, baseParam + weightedAvg, mergedParam)
+                mergedStateDict[paramName] = mergedParam
+            mergedExpert.load_state_dict(mergedStateDict)
+            return mergedExpert
+    def setBaseModel(self,encoding,model):
+        self.baseModel=[encoding,model.to("cuda").half()]
+
+classifier=Classifier(None,0.8,5,10,0.4)
+classifier.setBaseModel([1,3,0,2,4],GPT2LMHeadModel(GPT2Config()))
+start=time.time()
+print(classifier.getExpert([1,2,1,1,2],"asdf"))
+end=time.time()
+print(f"Time: {end-start}")
