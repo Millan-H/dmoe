@@ -1,35 +1,45 @@
 from memory import MemoryHandler
 from transformers import GPT2LMHeadModel, GPT2Config
 import torch
+import torch.nn.functional as f
+import cupy as cp
 import time
 
 class Classifier:
-    def __init__(self, weights, threshold, dmodel, expertMergeCount, cutThreshold):
-        if weights!=None:
-            self.weights=torch.tensor(weights,dtype=torch.bfloat16).to("cuda")
-        else:
-            self.weights=torch.tensor([1 for i in range(dmodel)],dtype=torch.bfloat16).to("cuda")
+    def __init__(self, threshold, cutThreshold, expertMergeCount):
         self.threshold=threshold
         self.expertMergeCount=expertMergeCount
         self.cutThreshold=cutThreshold
         self.firstRun=False
         self.baseModel=None
+        memory=MemoryHandler()
+        experts=memory.getExpertEncodings()
+        self.experts=torch.tensor(experts,dtype=torch.bfloat16).to("cuda")
+        self.currentTrainEncoding=None
+        self.currentTrainExpert=None
+        self.sortEncodings=None
     def getExpert(self, encoding, data=None, mode="prod"):
         memory=MemoryHandler()
         encoding=torch.tensor(encoding,dtype=torch.bfloat16).to("cuda")
-        experts=memory.getExpertEncodings()
-        self.experts=torch.tensor(experts,dtype=torch.bfloat16).to("cuda")
+
         if len(self.experts)==0:
             self.experts=torch.tensor([encoding],dtype=torch.bfloat16).to("cuda")
             startExpert=GPT2LMHeadModel(GPT2Config()).to("cuda")
             memory.writeExpert(encoding,startExpert.to(dtype=torch.bfloat16).state_dict())
-        differences=self.experts-encoding.unsqueeze(0)
-        comparisons=torch.mean(torch.abs(differences*self.weights), axis=1)
-        bestExpertIdx=torch.argmin(comparisons)
-        bestExpert=comparisons[bestExpertIdx]
-        bestExpertEncoding=self.experts[bestExpertIdx]
-        bestExpertDist=1-torch.mean(abs((bestExpertEncoding-encoding)/torch.maximum(bestExpertEncoding+1e-8, encoding+1e-8)))
-        if bestExpertDist<self.threshold:
+            experts=memory.getExpertEncodings()
+            self.experts=torch.tensor(experts,dtype=torch.bfloat16).to("cuda")
+        
+        comparisons=torch.cdist(torch.tensor(encoding,dtype=torch.float32).unsqueeze(0), torch.tensor(self.experts,dtype=torch.float32), p=2)
+        viableExperts=comparisons<self.threshold
+        trueCount=viableExperts.tolist().count(True)
+        if trueCount>=1:
+            if trueCount>=self.expertMergeCount:
+                sortedComparisons=torch.sort(comparisons[viableExperts[0]], descending=True)[0]
+                viableExperts=comparisons==sortedComparisons[0:self.expertMergeCount]
+            return self.mergeExperts(self.experts[viableExperts[0]])
+        else:
+            bestExpertIdx=torch.argmin(comparisons)
+            bestExpertEncoding=self.experts[bestExpertIdx]
             if self.baseModel!=None:
                 mergingExperts=[bestExpertEncoding]
                 comparisonCopy=comparisons.clone()
@@ -39,28 +49,102 @@ class Classifier:
                     sortedIndices = torch.argsort(remainingScores, descending=True)
                     numAdditionalExperts = min(len(sortedIndices), self.expertMergeCount - 1)
                     for idx in sortedIndices[:numAdditionalExperts]:
-                        mergingExperts.append(experts[int(idx)])
-                    mergingExperts=torch.tensor(mergingExperts,dtype=torch.bfloat16).to("cuda")
+                        mergingExperts.append(torch.tensor(self.experts[int(idx)],dtype=torch.bfloat16).to("cuda"))
+                    mergingExperts=torch.stack(mergingExperts).to("cuda")
                 mergingExpertsFiltered=self.filterExperts(mergingExperts,encoding)
                 if len(mergingExpertsFiltered)==0:
-                    if mode == "prod":
-                        mergingExpertsFiltered=bestExpertEncoding
-                    elif mode == "train":
-                        self.cacheData(encoding, data)
-                        return self.baseModel[0]
+                    return self.baseModel[1]
                 newExpert=self.mergeExperts(mergingExpertsFiltered).to("cuda")
-                memory.writeExpert(encoding,newExpert.to(dtype=torch.bfloat16).state_dict())
+                memory.writeExpert(encoding,newExpert)
+                experts=memory.getExpertEncodings()
+                self.experts=torch.tensor(experts,dtype=torch.bfloat16).to("cuda")
                 return encoding
             else:
                 return encoding
+    def getTrainExpert(self, encoding):
+        if encoding!=self.currentTrainEncoding:
+            self.currentTrainEncoding=torch.tensor(encoding,dtype=torch.bfloat16).to("cuda")
+            memory=MemoryHandler()
+            comparisons=f.cosine_similarity(self.currentTrainEncoding, self.experts, dim=1)
+            bestExpertIdx=torch.argmax(comparisons)
+            bestExpertEncoding=self.experts[bestExpertIdx]
+            mergingExperts=[bestExpertEncoding]
+            comparisonCopy=comparisons.clone()
+            comparisonCopy=torch.cat([comparisonCopy[:int(bestExpertIdx)], comparisonCopy[int(bestExpertIdx)+1:]])
+            if len(comparisonCopy)>0:
+                remainingScores = comparisons
+                sortedIndices = torch.argsort(remainingScores, descending=True)
+                numAdditionalExperts = min(len(sortedIndices), self.expertMergeCount - 1)
+                for idx in sortedIndices[:numAdditionalExperts]:
+                    mergingExperts.append(torch.tensor(self.experts[int(idx)],dtype=torch.bfloat16).to("cuda"))
+                mergingExperts=torch.stack(mergingExperts).to("cuda")
+            mergingExpertsFiltered=self.filterExperts(mergingExperts,encoding)
+            newExpert=self.mergeExperts(mergingExpertsFiltered).to("cuda")
+            memory.writeExpert(encoding,newExpert)
+            experts=memory.getExpertEncodings()
+            self.experts=torch.tensor(experts,dtype=torch.bfloat16).to("cuda")
+            self.currentTrainExpert=newExpert
+        return self.currentTrainExpert
+    def sort(self, encoding):
+        memory=MemoryHandler()
+        experts=[]
+        encoding=torch.tensor(encoding,dtype=torch.bfloat16).to("cuda")
+        for sortEncoding in self.sortEncodings:
+            cudaedSortEncoding=torch.tensor(sortEncoding).to("cuda").half()
+            if not torch.equal(cudaedSortEncoding,encoding):
+                experts.append(cudaedSortEncoding)
+        experts=torch.stack(experts).to("cuda").half()
+        comparisons=torch.cdist(torch.tensor(encoding,dtype=torch.float32).unsqueeze(0), torch.tensor(experts,dtype=torch.float32), p=2)[0]
+        viableExperts=comparisons<self.threshold
+        trueCount=viableExperts.tolist().count(True)
+        if trueCount>=1:
+            if trueCount>=self.expertMergeCount:
+                sortedComparisons=torch.sort(comparisons[viableExperts[0]], descending=True)[0]
+                viableExperts=comparisons==sortedComparisons[0:self.expertMergeCount]
+            return self.sortEncodings[viableExperts[0]]
         else:
-            return bestExpertEncoding
-    def filterExperts(self,experts,encoding):
+            bestExpertIdx=torch.argmin(comparisons)
+            bestExpertEncoding=experts[bestExpertIdx]
+            mergingExperts=[bestExpertEncoding]
+            comparisonCopy=comparisons.clone()
+            comparisonCopy=torch.cat([comparisonCopy[:int(bestExpertIdx)], comparisonCopy[int(bestExpertIdx)+1:]])
+            if len(comparisonCopy)>0:
+                remainingScores = comparisons
+                sortedIndices = torch.argsort(remainingScores, descending=True)
+                numAdditionalExperts = min(len(sortedIndices), self.expertMergeCount - 1)
+                for idx in sortedIndices[:numAdditionalExperts]:
+                    mergingExperts.append(torch.tensor(experts[int(idx)],dtype=torch.bfloat16).to("cuda"))
+                mergingExperts=torch.stack(mergingExperts).to("cuda")
+            mergingExpertsFiltered=self.filterExperts(mergingExperts,encoding)
+            if len(mergingExpertsFiltered)==0:
+                print('base')
+                return []
+            return mergingExpertsFiltered
+    def getCacheExpert(self, encoding):
+        memory=MemoryHandler()
+        encoding=torch.tensor(encoding,dtype=torch.bfloat16).to("cuda")
+
+        if len(self.experts)==0:
+            self.experts=torch.tensor([encoding],dtype=torch.bfloat16).to("cuda")
+            startExpert=GPT2LMHeadModel(GPT2Config()).to("cuda")
+            memory.writeExpert(encoding,startExpert.to(dtype=torch.bfloat16).state_dict())
+            experts=memory.getExpertEncodings()
+            self.experts=torch.tensor(experts,dtype=torch.bfloat16).to("cuda")
+        
+        comparisons=torch.cdist(torch.tensor(encoding,dtype=torch.float32).unsqueeze(0), torch.tensor(self.experts,dtype=torch.float32), p=2)
+
+        return self.experts[torch.argmin(comparisons)]
+    def setSortEncodings(self, encodings):
+        self.sortEncodings=encodings
+    def filterExperts(self,experts,encoding,trainingMode=False):
         if len(experts) <= 1:
             return experts
         self.experts = torch.tensor(experts,dtype=torch.bfloat16).to("cuda")
         expertDists=torch.mean(abs((experts-encoding)/torch.maximum(experts+1e-8, encoding+1e-8)))
-        return self.experts[expertDists > self.cutThreshold]
+        if not trainingMode:
+            return self.experts[expertDists < self.cutThreshold]
+        else:
+            return self.experts[expertDists < self.threshold]
     def cacheData(self,encoding,data):
         try:
             cachedData=torch.load("C:/Users/milla/dmoe/model/dataCache.pt")
@@ -72,11 +156,11 @@ class Classifier:
         if len(mergingExperts)<=1:
             return mergingExperts
         else:
-            mergedExpert = GPT2LMHeadModel(GPT2Config())
+            print('yayy')
             memory=MemoryHandler()
-            baseStateDict = self.baseModel[1].to("cuda").half().state_dict()
+            baseStateDict = self.baseModel[1]
             mergedStateDict = {}
-            expertStateDicts = [memory.getExpertFromEncoding(expert) for expert in mergingExperts]
+            expertStateDicts = mergingExperts
             numExperts = len(expertStateDicts)
             for paramName, baseParam in baseStateDict.items():
                 expertParams = torch.stack([
@@ -107,14 +191,28 @@ class Classifier:
                     weightedAvg = weightedDiffs.sum(dim=0) / totalWeights
                     mergedParam = torch.where(hasConflict, baseParam + weightedAvg, mergedParam)
                 mergedStateDict[paramName] = mergedParam
-            mergedExpert.load_state_dict(mergedStateDict)
-            return mergedExpert
+            return mergedStateDict
     def setBaseModel(self,encoding,model):
-        self.baseModel=[encoding,model.to("cuda").half()]
+        self.baseModel=[encoding,model.to("cuda").half().state_dict()]
 
-classifier=Classifier(None,0.8,5,10,0.4)
-classifier.setBaseModel([1,3,0,2,4],GPT2LMHeadModel(GPT2Config()))
+
+'''classifier=Classifier(4.8,5,5)
+encoding=torch.rand((1,150))[0]
+print(encoding)
+classifier.getExpert(encoding)'''
+'''classifier=Classifier(None,0.85,1000,10,0.5)
+classifier.setBaseModel(torch.randint(0,10,(1000, )),GPT2LMHeadModel(GPT2Config()))
+print("asdfasdf")
 start=time.time()
-print(classifier.getExpert([1,2,1,1,2],"asdf"))
+classifier.mergeExperts([GPT2LMHeadModel(GPT2Config()).to("cuda").half().state_dict(),GPT2LMHeadModel(GPT2Config()).to("cuda").half().state_dict()])
 end=time.time()
 print(f"Time: {end-start}")
+start=time.time()
+encodings=torch.randint(0,10,(1000,1000)).to("cuda").half()
+for encoding in encodings:
+    subStart=time.time()
+    classifier.getExpert(encoding,"asdf")
+    subEnd=time.time()
+    print(f"Subtime: {subEnd-subStart}")
+end=time.time()
+print(f"Time: {end-start}")'''

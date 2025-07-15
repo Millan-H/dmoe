@@ -1,5 +1,5 @@
-from dataAnalysis import DataAnalysis
-from classifier import Classifier
+from model.dataAnalysis import DataAnalysis
+from model.classifier import Classifier
 from bertopic import BERTopic
 from sentence_transformers import SentenceTransformer
 from collections import defaultdict
@@ -30,7 +30,6 @@ class DataHandler:
                 lowConfidence[topic].append(document)
         self.dataAnalysis.trainEncoder(topicsDict)
         self.dataAnalysis.getEncoding(data)
-        #clustering
         return topicsDict
     def trainBaseModel(self, data, baseSize, batchSize):
         indecies=torch.random.sample(range(len(data)),baseSize)
@@ -58,3 +57,5 @@ class DataHandler:
             loss.backward()
             optimizer.step()
         self.classifier.setBaseModel("base",baseModel.to(dtype=torch.bfloat16).state_dict())
+
+preProcesser=DataHandler()
